@@ -484,7 +484,11 @@ function PdfViewer({ dataUrl }: { dataUrl: string }) {
       .then(async (pdfjs) => {
         pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
         const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
-        const doc = await pdfjs.getDocument({ data: bytes }).promise;
+        // isEvalSupported: false — pdf.js otherwise compiles PostScript functions with
+        // `new Function()` in the worker, which inherits this document's CSP and would force
+        // 'unsafe-eval' into the policy. Slightly more CPU on CMap-heavy files; also mitigates
+        // CVE-2024-4367.
+        const doc = await pdfjs.getDocument({ data: bytes, isEvalSupported: false }).promise;
         const el = holder.current;
         if (cancelled || !el) return;
         el.innerHTML = "";
