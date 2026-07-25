@@ -12,12 +12,20 @@ import rightRailSource from "./components/RightRail.tsx?raw";
 // invisible to both vitest (jsdom) and Playwright (vite dev server). This file is the only
 // automated signal available; the end-to-end check is a packaged-build walkthrough.
 
+// Tauri's CspDirectiveSources accepts either a string or a list of sources, and the upstream docs
+// use both forms — so normalize rather than assume. Typing this as `string` alone would turn a
+// legal reformat of one directive into a list into `value.split is not a function`, i.e. a crash
+// instead of a verdict.
+type Sources = string | string[];
+
 const csp = (
-  tauriConf as unknown as { app: { security: { csp: Record<string, string> | null } } }
+  tauriConf as unknown as { app: { security: { csp: Record<string, Sources> | null } } }
 ).app.security.csp;
 
-const tokensOf = (directive: string): string[] =>
-  (csp?.[directive] ?? "").split(/\s+/).filter(Boolean);
+const toTokens = (value: Sources): string[] =>
+  (Array.isArray(value) ? value.join(" ") : value).split(/\s+/).filter(Boolean);
+
+const tokensOf = (directive: string): string[] => toTokens(csp?.[directive] ?? "");
 
 // Each directive and the sources it must allow, traced to real call sites:
 //   connect-src  ipc:/http://ipc.localhost  -> the invokes in src/tauri.ts (folder picker,
@@ -26,14 +34,18 @@ const tokensOf = (directive: string): string[] =>
 //   img-src      data: -> data_url attachment previews and Vite-inlined provider logos;
 //                https: -> remote images in agent-authored markdown.
 //   style-src    'unsafe-inline' -> React `style={{…}}` attributes, which cannot take a nonce.
-//   worker-src   the bundled pdf.js worker.
+//   worker-src   'self' for the bundled pdf.js worker, and blob: because pdf.js re-wraps it:
+//                the shipped build wraps workerSrc in a blob: URL whenever the document origin is
+//                non-HTTP, and Tauri serves tauri://localhost on macOS/Linux, whose URL origin is
+//                "null". Dropping blob: breaks PDF preview on those platforms only — Windows uses
+//                http://tauri.localhost and would keep working, hiding it.
 const REQUIRED: ReadonlyArray<readonly [string, readonly string[]]> = [
   ["default-src", ["'self'"]],
   ["script-src", ["'self'"]],
   ["style-src", ["'self'", "'unsafe-inline'"]],
   ["img-src", ["'self'", "data:", "https:"]],
   ["font-src", ["'self'"]],
-  ["worker-src", ["'self'"]],
+  ["worker-src", ["'self'", "blob:"]],
   [
     "connect-src",
     ["'self'", "ipc:", "http://ipc.localhost", "http://127.0.0.1:*", "ws://127.0.0.1:*"],
@@ -45,6 +57,15 @@ const REQUIRED: ReadonlyArray<readonly [string, readonly string[]]> = [
 ];
 
 describe("desktop CSP", () => {
+  // Both config shapes must read the same, so switching a directive to the list form stays a
+  // verdict rather than becoming a TypeError.
+  it.each([
+    { shape: "string", value: "'self' blob:" as Sources },
+    { shape: "list", value: ["'self'", "blob:"] as Sources },
+  ])("reads a directive written in $shape form", ({ value }) => {
+    expect(toTokens(value)).toEqual(["'self'", "blob:"]);
+  });
+
   it("is configured at all (the #99 regression: csp was null)", () => {
     expect(csp).toBeTruthy();
     expect(typeof csp).toBe("object");
@@ -61,13 +82,15 @@ describe("desktop CSP", () => {
 
   // Forbidden sources. `'unsafe-eval'` is why RightRail passes isEvalSupported: false to pdf.js,
   // and `'unsafe-inline'` in script-src would defeat the point of the policy — Tauri hashes the
-  // inline theme script in index.html at build time, so it is never needed.
+  // inline theme script in index.html at build time, so it is never needed. The directives to scan
+  // are carried in the row, not re-derived from the test name: a label is documentation, and using
+  // it as control flow means a typo silently widens what gets checked.
+  const allDirectives = () => Object.keys(csp ?? {});
   it.each([
-    ["'unsafe-eval'", "any directive"],
-    ["'unsafe-inline'", "script-src"],
-  ])("never allows %s in %s", (token, scope) => {
-    const directives = scope === "script-src" ? ["script-src"] : Object.keys(csp ?? {});
-    for (const directive of directives) expect(tokensOf(directive)).not.toContain(token);
+    { token: "'unsafe-eval'", where: "any directive", directives: allDirectives },
+    { token: "'unsafe-inline'", where: "script-src", directives: () => ["script-src"] },
+  ])("never allows $token in $where", ({ token, directives }) => {
+    for (const directive of directives()) expect(tokensOf(directive)).not.toContain(token);
   });
 
   // Edge case: a bare `*` is a wildcard host and must never appear, but the loopback entries
