@@ -39,6 +39,12 @@ const tokensOf = (directive: string): string[] => toTokens(csp?.[directive] ?? "
 //                non-HTTP, and Tauri serves tauri://localhost on macOS/Linux, whose URL origin is
 //                "null". Dropping blob: breaks PDF preview on those platforms only — Windows uses
 //                http://tauri.localhost and would keep working, hiding it.
+//   child-src    the same sources again, as the pre-CSP3 fallback. worker-src is Safari 15.5+,
+//                which shipped in macOS 12.4, but the bundle declares minimumSystemVersion 12.0.
+//                On 12.0-12.3 worker-src is ignored and the chain is worker-src -> child-src ->
+//                script-src -> default-src, so without child-src the workers land on
+//                script-src 'self' and PDF preview breaks again. frame-src is Safari 7 and takes
+//                precedence for frames, so this does not widen framing.
 const REQUIRED: ReadonlyArray<readonly [string, readonly string[]]> = [
   ["default-src", ["'self'"]],
   ["script-src", ["'self'"]],
@@ -46,6 +52,7 @@ const REQUIRED: ReadonlyArray<readonly [string, readonly string[]]> = [
   ["img-src", ["'self'", "data:", "https:"]],
   ["font-src", ["'self'"]],
   ["worker-src", ["'self'", "blob:"]],
+  ["child-src", ["'self'", "blob:"]],
   [
     "connect-src",
     ["'self'", "ipc:", "http://ipc.localhost", "http://127.0.0.1:*", "ws://127.0.0.1:*"],
@@ -100,6 +107,13 @@ describe("desktop CSP", () => {
     for (const directive of Object.keys(csp ?? {})) {
       expect(tokensOf(directive)).not.toContain("*");
     }
+  });
+
+  // child-src is only consulted where worker-src is unsupported, so the two must not drift: any
+  // source worker-src grants has to be in child-src too, or the older-WebKit path is stricter than
+  // the modern one and fails only on the platforms hardest to test.
+  it("keeps child-src a superset of worker-src for the pre-CSP3 fallback", () => {
+    expect(tokensOf("child-src")).toEqual(expect.arrayContaining(tokensOf("worker-src")));
   });
 
   it("keeps the port wildcard on the loopback sidecar origins", () => {
