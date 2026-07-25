@@ -1338,6 +1338,9 @@ class SessionManager:
                     **d.to_dict(),
                     "configured": configured,
                     "values": values,
+                    # Whether a key is STORED (never its value) — `configured` can't say that
+                    # for a keyless provider, whose optional key the form must still surface.
+                    "has_key": bool(profile.get("api_key")),
                     "suggested_models": self._suggested_models(d.name),
                     # Key hygiene for the Settings pane: when the key was saved (date, stamped
                     # by set_provider) and when the provider last served a completion (epoch,
@@ -1451,6 +1454,9 @@ class SessionManager:
                 profile[f.key] = val
             elif not f.required:
                 profile.pop(f.key, None)
+                if f.key == "api_key":
+                    # Clearing an optional key must not leave "key added <date>" behind.
+                    profile.pop("key_set_at", None)
         missing = [f.label for f in d.fields if f.required and not profile.get(f.key)]
         if missing:
             return {"ok": False, "error": "missing: " + ", ".join(missing)}
@@ -1559,6 +1565,34 @@ class SessionManager:
         self._save_prefs()
         return {"ok": True, "dm_session": self.dm_session()}
 
+    def _ollama_tags(self, timeout: float) -> Optional[list[str]]:
+        """Model names on the configured Ollama-class server, or None if it didn't answer.
+
+        The native `/api/tags` first; on 404 fall back to the OpenAI-compatible `/v1/models` —
+        servers like oMLX speak only the latter. A stored `api_key` rides as a Bearer token so
+        a local server behind an auth layer still lists its models. Never raises.
+        """
+        import httpx
+
+        profile = self.secrets.get("provider:ollama") or {}
+        base = (profile.get("base_url") or "http://localhost:11434").strip().rstrip("/")
+        if base.endswith("/v1"):
+            base = base[: -len("/v1")]
+        key = (profile.get("api_key") or "").strip()
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        try:
+            resp = httpx.get(base + "/api/tags", headers=headers, timeout=timeout)
+            if resp.status_code == 404:
+                resp = httpx.get(base + "/v1/models", headers=headers, timeout=timeout)
+                if resp.status_code >= 300:
+                    return None
+                return [m["id"] for m in resp.json().get("data", []) if m.get("id")]
+            if resp.status_code >= 300:
+                return None
+            return [m["name"] for m in resp.json().get("models", []) if m.get("name")]
+        except Exception:
+            return None
+
     def _ollama_alive(self) -> bool:
         """Best-effort local-Ollama liveness, cached 30s (get_settings runs on every GUI
         fetch — no 2s probe inline). Keyless is not the same as PRESENT: `ollama:*` picker
@@ -1571,38 +1605,17 @@ class SessionManager:
         cached = getattr(self, "_ollama_alive_cache", None)
         if cached and now - cached[0] < 30:
             return cached[1]
-        profile = self.secrets.get("provider:ollama") or {}
-        base = (profile.get("base_url") or "http://localhost:11434").strip().rstrip("/")
-        if base.endswith("/v1"):
-            base = base[: -len("/v1")]
-        try:
-            import httpx
-
-            alive = httpx.get(base + "/api/tags", timeout=0.8).status_code == 200
-        except Exception:
-            alive = False
+        alive = self._ollama_tags(0.8) is not None
         self._ollama_alive_cache = (now, alive)
         return alive
 
     def _ollama_models(self) -> list[str]:
-        """Live list of models pulled into the configured Ollama server (via its native
-        `/api/tags`), as `ollama:<name>` so they're directly selectable. Empty if Ollama isn't
-        configured or unreachable — best-effort, never raises."""
-        profile = self.secrets.get("provider:ollama")
-        if not profile:
+        """Live list of models the configured Ollama server serves, as `ollama:<name>` so
+        they're directly selectable. Empty if Ollama isn't configured or unreachable —
+        best-effort, never raises."""
+        if not self.secrets.get("provider:ollama"):
             return []
-        base = (profile.get("base_url") or "http://localhost:11434").strip().rstrip("/")
-        if base.endswith("/v1"):
-            base = base[: -len("/v1")]
-        try:
-            import httpx
-
-            data = httpx.get(base + "/api/tags", timeout=2.0).json()
-            return [
-                f"ollama:{m['name']}" for m in data.get("models", []) if m.get("name")
-            ]
-        except Exception:
-            return []
+        return [f"ollama:{name}" for name in (self._ollama_tags(2.0) or [])]
 
     def _curated_models(self) -> list[str]:
         """The models offered in the composer's selector: every curated-matrix model
@@ -3338,6 +3351,10 @@ class SessionManager:
         invalidate = getattr(self.provider, "invalidate", None)
         if callable(invalidate):
             invalidate(name)
+        if name in (None, "ollama"):
+            # A new key or URL must re-probe: a 30s-stale "not alive" verdict from an
+            # unauthenticated probe would otherwise keep the models hidden after a save.
+            self._ollama_alive_cache = None
 
     # -- read models ------------------------------------------------------------
     def list_sessions(self, workspace: Optional[str] = None) -> list[dict[str, Any]]:

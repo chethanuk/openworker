@@ -204,26 +204,29 @@ _NATIVE_OK = (200, {"models": [{"name": "qwen3-coder:30b"}, {"noname": 1}]})
 _COMPAT_OK = (200, {"data": [{"id": "qwen3-coder:30b"}, {"noid": 1}]})
 
 
+_BASE = {"base_url": "http://localhost:11434"}
+
+
 @pytest.mark.parametrize(
     "profile,routes,expected",
     [
         # stock Ollama: native endpoint answers, no key stored, no auth header sent
-        ({}, {_TAGS_URL: _NATIVE_OK}, ["qwen3-coder:30b"]),
+        (_BASE, {_TAGS_URL: _NATIVE_OK}, ["qwen3-coder:30b"]),
         # a proxied Ollama: same native endpoint, key forwarded
-        ({"api_key": "sk-omlx-abc"}, {_TAGS_URL: _NATIVE_OK}, ["qwen3-coder:30b"]),
+        ({**_BASE, "api_key": "sk-omlx-abc"}, {_TAGS_URL: _NATIVE_OK}, ["qwen3-coder:30b"]),
         # oMLX: no native API at all — fall back to the OpenAI-compatible listing
         (
-            {"api_key": "sk-omlx-abc"},
+            {**_BASE, "api_key": "sk-omlx-abc"},
             {_TAGS_URL: (404, {}), _MODELS_URL: _COMPAT_OK},
             ["qwen3-coder:30b"],
         ),
         # a `/v1` base URL is normalised back to the root before probing
         ({"base_url": "http://localhost:11434/v1"}, {_TAGS_URL: _NATIVE_OK}, ["qwen3-coder:30b"]),
         # rejected, unreachable, or a broken fallback → unknown, never a partial list
-        ({}, {_TAGS_URL: (401, {})}, None),
-        ({}, {_TAGS_URL: (500, {})}, None),
-        ({}, {_TAGS_URL: (404, {}), _MODELS_URL: (401, {})}, None),
-        ({}, {_TAGS_URL: ConnectionError("refused")}, None),
+        (_BASE, {_TAGS_URL: (401, {})}, None),
+        (_BASE, {_TAGS_URL: (500, {})}, None),
+        (_BASE, {_TAGS_URL: (404, {}), _MODELS_URL: (401, {})}, None),
+        (_BASE, {_TAGS_URL: ConnectionError("refused")}, None),
     ],
 )
 def test_ollama_tags_auth_and_v1_fallback(tmp_path, monkeypatch, profile, routes, expected):
@@ -239,6 +242,16 @@ def test_ollama_tags_auth_and_v1_fallback(tmp_path, monkeypatch, profile, routes
     assert auth == (f"Bearer {profile['api_key']}" if profile.get("api_key") else None)
     # and the public surfaces built on it agree
     assert manager._ollama_models() == [f"ollama:{m}" for m in (expected or [])]
+
+
+def test_ollama_models_empty_until_configured(tmp_path, monkeypatch):
+    """No stored profile → no probe and no suggestions (unchanged by the auth support)."""
+    from coworker.server.manager import SessionManager
+
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    manager = SessionManager(data_dir=tmp_path / "data")
+    _patch_tag_responses(monkeypatch, {})  # any probe at all is a failure
+    assert manager._ollama_models() == []
 
 
 def test_saving_a_key_reprobes_a_stale_liveness_verdict(tmp_path, monkeypatch):
