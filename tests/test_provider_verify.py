@@ -90,6 +90,44 @@ def test_verify_ollama_uses_v1_models_no_key(monkeypatch):
     assert "headers" not in cap  # keyless
 
 
+# #97: local servers that DO require a key (oMLX, a proxied `ollama serve`) must get it on
+# the Test probe — while a keyless server keeps sending no auth header at all.
+@pytest.mark.parametrize(
+    "key,expected_auth",
+    [
+        (None, None),
+        ("", None),
+        ("   ", None),
+        ("sk-omlx-abc", "Bearer sk-omlx-abc"),
+    ],
+)
+def test_verify_ollama_bearer_only_when_key_set(monkeypatch, key, expected_auth):
+    cap: dict = {}
+    _patch_get(monkeypatch, status=200, capture=cap)
+    verify_provider_key("ollama", api_key=key, base_url="http://localhost:11435")
+    assert cap["url"] == "http://localhost:11435/v1/models"
+    assert cap.get("headers", {}).get("Authorization") == expected_auth
+
+
+@pytest.mark.parametrize(
+    "status,ok,error",
+    [
+        (200, True, None),
+        (401, False, "Server rejected the request — add or check the API key."),
+        (403, False, "Server rejected the request — add or check the API key."),
+        (404, False, "Reached the server, but no OpenAI-compatible /v1 API there."),
+        (500, False, "Ollama (local models) returned HTTP 500."),
+    ],
+)
+def test_verify_ollama_status_mapping(monkeypatch, status, ok, error):
+    _patch_get(monkeypatch, status=status)
+    res = verify_provider_key(
+        "ollama", api_key="sk-omlx-abc", base_url="http://localhost:11435"
+    )
+    assert res["ok"] is ok
+    assert res.get("error") == error
+
+
 def test_verify_network_error_is_clean(monkeypatch):
     _patch_get(monkeypatch, raise_exc=ConnectionError("boom"))
     res = verify_provider_key("openai", api_key="sk-x")

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from coworker.providers import (
     AssistantTurn,
     ModelCapabilities,
@@ -69,6 +71,34 @@ def test_build_ollama_client_uses_base_url(monkeypatch):
     client._ensure_client()  # type: ignore[attr-defined]
     assert captured["base_url"] == "http://box:11434/v1"
     assert captured["api_key"] == "ollama"  # placeholder, Ollama ignores it
+
+
+@pytest.mark.parametrize(
+    "profile_key,expected",
+    [
+        (None, "ollama"),  # stock `ollama serve` — the placeholder the SDK requires
+        ("", "ollama"),
+        ("   ", "ollama"),
+        ("sk-omlx-abc", "sk-omlx-abc"),  # #97: a local server that checks the key
+        ("  sk-omlx-abc  ", "sk-omlx-abc"),
+    ],
+)
+def test_build_ollama_client_key_is_optional(monkeypatch, profile_key, expected):
+    """A stored key wins over the placeholder; an absent/blank one keeps today's behaviour.
+    The placeholder can't just become None — the OpenAI SDK rejects an empty api_key."""
+    captured: dict = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+    profile: dict = {"base_url": "http://box:11434"}
+    if profile_key is not None:
+        profile["api_key"] = profile_key
+    client = build_provider_client("ollama", profile, secrets=None)
+    client._ensure_client()  # type: ignore[attr-defined]
+    assert captured["api_key"] == expected
 
 
 # -- router routing -------------------------------------------------------------

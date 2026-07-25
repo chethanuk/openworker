@@ -8,6 +8,9 @@ and the REST round-trip. No network, no model calls.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from coworker.providers import resolve_api_key
 from coworker.secrets import SecretStore
@@ -174,3 +177,86 @@ def test_ollama_models_gated_on_liveness(tmp_path, monkeypatch):
 
     monkeypatch.setattr(SessionManager, "_ollama_alive", lambda self: True)
     assert "ollama:llama3.3" in manager.get_settings()["models"]
+
+
+# -- #97: discovering models on an Ollama-class server (auth optional, /api/tags optional) --
+def _patch_tag_responses(monkeypatch, routes):
+    """Route URL -> (status, json). `routes` values may raise to simulate a dead server."""
+    seen: list[tuple[str, dict]] = []
+
+    def fake_get(url, **kwargs):
+        seen.append((url, kwargs.get("headers") or {}))
+        outcome = routes.get(url)
+        if outcome is None:
+            raise AssertionError(f"unexpected probe: {url}")
+        if isinstance(outcome, Exception):
+            raise outcome
+        status, payload = outcome
+        return SimpleNamespace(status_code=status, json=lambda: payload)
+
+    monkeypatch.setattr("httpx.get", fake_get)
+    return seen
+
+
+_TAGS_URL = "http://localhost:11434/api/tags"
+_MODELS_URL = "http://localhost:11434/v1/models"
+_NATIVE_OK = (200, {"models": [{"name": "qwen3-coder:30b"}, {"noname": 1}]})
+_COMPAT_OK = (200, {"data": [{"id": "qwen3-coder:30b"}, {"noid": 1}]})
+
+
+@pytest.mark.parametrize(
+    "profile,routes,expected",
+    [
+        # stock Ollama: native endpoint answers, no key stored, no auth header sent
+        ({}, {_TAGS_URL: _NATIVE_OK}, ["qwen3-coder:30b"]),
+        # a proxied Ollama: same native endpoint, key forwarded
+        ({"api_key": "sk-omlx-abc"}, {_TAGS_URL: _NATIVE_OK}, ["qwen3-coder:30b"]),
+        # oMLX: no native API at all — fall back to the OpenAI-compatible listing
+        (
+            {"api_key": "sk-omlx-abc"},
+            {_TAGS_URL: (404, {}), _MODELS_URL: _COMPAT_OK},
+            ["qwen3-coder:30b"],
+        ),
+        # a `/v1` base URL is normalised back to the root before probing
+        ({"base_url": "http://localhost:11434/v1"}, {_TAGS_URL: _NATIVE_OK}, ["qwen3-coder:30b"]),
+        # rejected, unreachable, or a broken fallback → unknown, never a partial list
+        ({}, {_TAGS_URL: (401, {})}, None),
+        ({}, {_TAGS_URL: (500, {})}, None),
+        ({}, {_TAGS_URL: (404, {}), _MODELS_URL: (401, {})}, None),
+        ({}, {_TAGS_URL: ConnectionError("refused")}, None),
+    ],
+)
+def test_ollama_tags_auth_and_v1_fallback(tmp_path, monkeypatch, profile, routes, expected):
+    from coworker.server.manager import SessionManager
+
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    manager = SessionManager(data_dir=tmp_path / "data")
+    manager.secrets.put("provider:ollama", profile)
+    seen = _patch_tag_responses(monkeypatch, routes)
+
+    assert manager._ollama_tags(1.0) == expected
+    auth = seen[0][1].get("Authorization")
+    assert auth == (f"Bearer {profile['api_key']}" if profile.get("api_key") else None)
+    # and the public surfaces built on it agree
+    assert manager._ollama_models() == [f"ollama:{m}" for m in (expected or [])]
+
+
+def test_saving_a_key_reprobes_a_stale_liveness_verdict(tmp_path, monkeypatch):
+    """A cached "not alive" from an unauthenticated probe must not hide the models for 30s
+    after the user saves a working key."""
+    import time
+
+    from coworker.server.manager import SessionManager
+
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    manager = SessionManager(data_dir=tmp_path / "data")
+    # another provider owns the default, so the assertion below can only be satisfied by the
+    # liveness probe re-running — not by get_settings() force-keeping the default model.
+    manager.secrets.put("provider:openai", {"api_key": "sk-test"})
+    manager.add_model("ollama:qwen3-coder:30b")
+    manager._ollama_alive_cache = (time.monotonic(), False)
+    assert "ollama:qwen3-coder:30b" not in manager.get_settings()["models"]
+
+    _patch_tag_responses(monkeypatch, {_TAGS_URL: _NATIVE_OK})
+    manager.set_provider("ollama", {"api_key": "sk-omlx-abc"})
+    assert "ollama:qwen3-coder:30b" in manager.get_settings()["models"]
