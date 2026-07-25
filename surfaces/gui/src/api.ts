@@ -1213,6 +1213,7 @@ export interface ProviderInfo {
   needs_key: boolean;
   fields: ProviderField[];
   configured: boolean;
+  has_key?: boolean; // a key IS stored (never its value) — an optional key's only signal
   values: Record<string, string>; // non-secret stored values (e.g. base_url), for prefilling
   suggested_models: string[]; // bare model-name suggestions for the "add model" datalist
   recommended_model: string | null; // pre-filled default for this provider (e.g. qwen3-coder:30b)

@@ -33,6 +33,12 @@ export const KEY_HELP: Record<string, { url: string; label: string }> = {
 
 export type Verify = { state: "idle" | "testing" | "ok" | "error"; msg?: string };
 
+/** The field that IS a provider's credential — a required secret. An optional secret (#97: a
+ *  local server that happens to want a key) is an extra: it renders inline in field order and
+ *  never turns a keyless provider's form into a keyed one. */
+const isKeySlot = (f: { secret: boolean; required: boolean }) => f.secret && f.required;
+const isKeyed = (info?: ProviderInfo) => (info?.fields || []).some(isKeySlot);
+
 /** Brand chip: always a light plate so multicolor marks read on any theme. */
 export function ProviderMark({ name, title, size = 32 }: { name: string; title: string; size?: number }) {
   const url = PROVIDER_LOGOS[name];
@@ -198,7 +204,13 @@ export function useProviderSetup(opts?: { onSaved?: () => void }): ProviderSetup
   // Settings-only: forget the stored key; the card reverts to "Not set up".
   const removeKey = async () => {
     if (!sel) return;
-    await removeProvider(sel).catch(() => {});
+    if (info && !info.needs_key) {
+      // Keyless provider with an optional key (#97): drop just the key. Deleting the whole
+      // profile would take the server URL with it — the part that isn't a credential.
+      await setProvider(sel, { api_key: "" }).catch(() => {});
+    } else {
+      await removeProvider(sel).catch(() => {});
+    }
     setDrafts((d) => ({ ...d, [sel]: {} }));
     setKeylessOk((s) => {
       const next = new Set(s);
@@ -250,7 +262,11 @@ export function useProviderSetup(opts?: { onSaved?: () => void }): ProviderSetup
     // The in-field saved state (§39): green border + pill INSIDE the key box — shown
     // for stored credentials and fresh test-passes alike; typing clears it.
     savedState: (credentialed && !dirty) || verify.state === "ok",
-    secretFilled: (info?.fields || []).every((f) => !f.secret || (fields[f.key] || "").trim()),
+    // Only REQUIRED secrets gate the Test button. A keyless provider's optional key (#97 —
+    // oMLX, a proxied Ollama) must never disable Detect for everyone who doesn't need one.
+    secretFilled: (info?.fields || []).every(
+      (f) => !f.secret || !f.required || (fields[f.key] || "").trim(),
+    ),
     openProvider,
     backToGallery,
     runTestAndSave,
@@ -331,22 +347,29 @@ export function ProviderForm({
       {info?.blurb && <p className="text-[11.5px] text-faint mt-1">{info.blurb}</p>}
 
       {(info?.fields || []).map((f) => {
-        const keyed = (info?.fields || []).some((x) => x.secret);
+        const keyed = isKeyed(info);
         // A keyed provider's base_url is an expert option — it renders BELOW the key-help
         // line as its own advanced section (owner nit 2026-07-19), not inside the loop.
         if (f.key === "base_url" && keyed) return null;
         const testable =
-          (f.secret && f.key === (info?.fields || []).find((x) => x.secret)?.key) ||
+          (isKeySlot(f) && f.key === (info?.fields || []).find(isKeySlot)?.key) ||
           (!keyed && f.key === (info?.fields || [])[0]?.key);
+        // An optional secret is an extra, not the provider's credential: it renders inline in
+        // field order and wears no saved pill of its own (#97).
+        const keySlot = isKeySlot(f);
         return (
           <div key={f.key}>
             <label className={label}>{f.label}</label>
             <div className="flex gap-2">
               <div className="relative flex-1 min-w-0">
                 <input
-                  className={input + (ps.savedState && f.secret ? " border-ok pr-32" : " border-line")}
+                  className={input + (ps.savedState && keySlot ? " border-ok pr-32" : " border-line")}
                   type={f.secret ? "password" : "text"}
-                  placeholder={f.secret && ps.credentialed && !ps.dirty ? "••••••••" : f.placeholder}
+                  placeholder={
+                    f.secret && (ps.credentialed || info?.has_key) && !ps.dirty
+                      ? "••••••••"
+                      : f.placeholder
+                  }
                   value={ps.fields[f.key] || ""}
                   data-testid={`${tp}-field-${f.key}`}
                   onChange={(e) => ps.setFieldValue(f.key, e.target.value)}
@@ -361,7 +384,7 @@ export function ProviderForm({
                   </span>
                 )}
                 {/* §39: state lives IN the field — no status lines below. */}
-                {ps.savedState && f.secret && (
+                {ps.savedState && keySlot && (
                   <span
                     className="absolute right-2 top-1/2 -translate-y-1/2 text-[11px] font-medium text-ok bg-okSoft rounded-full px-2 py-0.5 pointer-events-none"
                     data-testid={`${tp}-saved-pill`}
@@ -369,7 +392,7 @@ export function ProviderForm({
                     ✓ Tested &amp; saved
                   </span>
                 )}
-                {ps.savedState && !f.secret && testable && (
+                {ps.savedState && !keySlot && testable && (
                   <span
                     className="absolute right-2 top-1/2 -translate-y-1/2 text-[11px] font-medium text-ok bg-okSoft rounded-full px-2 py-0.5 pointer-events-none"
                     data-testid={`${tp}-saved-pill`}
@@ -408,7 +431,8 @@ export function ProviderForm({
       )}
       {info && !info.needs_key && (
         <p className="text-[11.5px] text-faint mt-2">
-          No API key needed — Ollama runs models on this Mac.{" "}
+          No API key needed for a standard Ollama install — it runs models on this Mac. Add one only
+          if your local server requires auth (e.g. oMLX).{" "}
           <button
             className="text-muted underline decoration-line underline-offset-2 hover:text-ink"
             onClick={() => openExternal("https://ollama.com/download")}
@@ -422,8 +446,9 @@ export function ProviderForm({
           with enough separation to read as its own advanced row — no explainer copy
           (owner calls 2026-07-18 + 2026-07-19). */}
       {(() => {
-        const keyed = (info?.fields || []).some((x) => x.secret);
-        const ep = keyed ? (info?.fields || []).find((f) => f.key === "base_url") : undefined;
+        const ep = isKeyed(info)
+          ? (info?.fields || []).find((f) => f.key === "base_url")
+          : undefined;
         if (!ep) return null;
         if (!ps.showEndpoint)
           return (

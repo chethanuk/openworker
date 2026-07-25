@@ -103,7 +103,7 @@ export function ModelsTab() {
         ps={ps}
         tp="set"
         footer={
-          ps.credentialed ? (
+          ps.credentialed || info?.has_key ? (
             <button
               className="text-[12.5px] text-danger/80 hover:text-danger hover:underline underline-offset-2"
               data-testid="set-remove-key"

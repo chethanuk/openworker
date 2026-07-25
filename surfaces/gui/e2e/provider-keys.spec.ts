@@ -71,3 +71,46 @@ test("non-secret fields blur-save on a configured provider (ollama endpoint)", a
   await page.getByTestId("set-provider-ollama").click();
   await expect(page.getByTestId("set-field-base_url")).toHaveValue("http://127.0.0.1:9999");
 });
+
+// #97: local servers can require a key (oMLX, a proxied `ollama serve`), so the keyless
+// provider grew an OPTIONAL secret. It must not turn the form into a keyed one: the endpoint
+// stays inline (not behind the Custom endpoint disclosure) and Detect stays usable with the
+// key box empty — otherwise every plain-Ollama user is blocked by a field they don't need.
+test("an optional key renders below the endpoint without gating Detect (ollama)", async ({
+  page,
+}) => {
+  await openModels(page);
+  await page.getByTestId("set-provider-ollama").click();
+
+  await expect(page.getByTestId("set-field-base_url")).toBeVisible();
+  await expect(page.getByTestId("set-field-api_key")).toBeVisible();
+  await expect(page.getByTestId("set-endpoint-link")).toHaveCount(0);
+  await expect(page.getByTestId("set-field-api_key")).toHaveAttribute("type", "password");
+  await expect(page.getByTestId("set-test")).toBeEnabled();
+  await expect(page.getByTestId("set-test")).toHaveText("Detect");
+});
+
+test("an optional key saves, reads back as stored, and can be removed (ollama)", async ({
+  page,
+}) => {
+  await openModels(page);
+  page.on("dialog", (d) => d.accept());
+  await page.getByTestId("set-provider-ollama").click();
+
+  await page.getByTestId("set-field-api_key").fill("sk-omlx-realkey");
+  await page.getByTestId("set-test").click();
+  await expect(page.getByTestId("set-provider-ollama")).toBeVisible(); // slid home after saving
+
+  // Reopened: the stored key shows as masked, never as its value, and can be removed.
+  await page.getByTestId("set-provider-ollama").click();
+  await expect(page.getByTestId("set-field-api_key")).toHaveValue("");
+  await expect(page.getByTestId("set-field-api_key")).toHaveAttribute("placeholder", "••••••••");
+  await page.getByTestId("set-remove-key").click();
+
+  await page.getByTestId("set-provider-ollama").click();
+  await expect(page.getByTestId("set-field-api_key")).toHaveAttribute(
+    "placeholder",
+    "Only if your server requires one",
+  );
+  await expect(page.getByTestId("set-remove-key")).toHaveCount(0);
+});
