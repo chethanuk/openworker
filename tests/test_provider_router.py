@@ -362,8 +362,9 @@ def test_manager_curated_models(tmp_path, monkeypatch):
     assert "anthropic:claude-opus-4-8" in models
     assert "gpt-4o" not in models  # no OpenAI seed anywhere
 
-    added = mgr.add_model("ollama:qwen2.5-coder:32b")  # keyless provider → selectable
-    assert added["ok"] and "ollama:qwen2.5-coder:32b" in added["models"]
+    added = mgr.add_model("ollama:qwen2.5-coder:32b")  # keyless provider → selectable when alive
+    monkeypatch.setattr(SessionManager, "_ollama_alive", lambda self: True)
+    assert added["ok"] and "ollama:qwen2.5-coder:32b" in mgr.get_settings()["models"]
 
     n = len(mgr.get_settings()["models"])
     mgr.add_model("ollama:qwen2.5-coder:32b")  # idempotent
