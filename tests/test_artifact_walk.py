@@ -36,6 +36,8 @@ def test_os_data_dirs_are_not_traversed(tmp_path, monkeypatch):
 
     monkeypatch.setattr("coworker.server.manager.os.walk", spy)
     m = SessionManager(data_dir=tmp_path / "data", workspace=str(ws))
+    from coworker.sessions import SessionRecord
+    m.session_store.save(SessionRecord(session_id="s1", workspace=str(ws), model="m", mode="m"))
     names = [a["name"] for a in m.list_artifacts("s1")]
 
     assert "report.md" in names
@@ -48,3 +50,27 @@ def test_os_data_dirs_are_not_traversed(tmp_path, monkeypatch):
 
 def test_os_data_dirs_cover_mac_and_windows():
     assert {"Library", "AppData", "Application Data"} <= OS_DATA_DIRS
+
+
+def test_list_artifacts_includes_extra_roots(tmp_path):
+    from coworker.server.manager import SessionManager, SessionRecord
+
+    m = SessionManager(data_dir=tmp_path / "data", workspace=str(tmp_path / "default"))
+    sid = "s_extra_root"
+    scratch = tmp_path / "scratch"
+    extra = tmp_path / "extra"
+    scratch.mkdir()
+    extra.mkdir()
+    (extra / "report.pdf").write_bytes(b"%PDF-1.4 test")
+
+    m.session_store.save(SessionRecord(session_id=sid, workspace=str(scratch), model="m", mode="m"))
+    m.add_root(sid, str(extra))
+
+    artifacts = m.list_artifacts(sid)
+    names = [a["name"] for a in artifacts]
+    assert "report.pdf" in names
+
+    target, err = m._artifact_target(sid, "report.pdf")
+    assert err is None
+    assert target == (extra / "report.pdf").resolve()
+
