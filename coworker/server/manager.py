@@ -1239,12 +1239,8 @@ class SessionManager:
         return browser_close_session()
 
     def list_artifacts(self, session_id: str) -> list[dict[str, Any]]:
-        record = self.session_store.load(session_id)
-        workspace = record.workspace if record else self.default_workspace
-        if not workspace:
-            return []
-        root = Path(workspace).expanduser().resolve()
-        if not root.is_dir():
+        roots = [Path(r["path"]).expanduser().resolve() for r in self.get_roots(session_id)]
+        if not roots:
             return []
         out: list[dict[str, Any]] = []
         suffixes = {
@@ -1283,33 +1279,41 @@ class SessionManager:
         from ..tools.search import OS_DATA_DIRS
 
         skip = {"node_modules", "target", "dist", "__pycache__"} | OS_DATA_DIRS
-        for dirpath, dirs, files in os.walk(root):
-            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in skip]
-            for name in files:
-                if name.startswith("."):
-                    continue
-                path = Path(dirpath) / name
-                if path.suffix.lower() not in suffixes:
-                    continue
-                try:
-                    st = path.stat()
-                    if not path.is_file():
+        seen_paths: set[Path] = set()
+        for root in roots:
+            if not root.is_dir():
+                continue
+            for dirpath, dirs, files in os.walk(root):
+                dirs[:] = [d for d in dirs if not d.startswith(".") and d not in skip]
+                for name in files:
+                    if name.startswith("."):
                         continue
-                    out.append(
-                        {
-                            "path": str(path.relative_to(root)),
-                            # Absolute path for "Copy path" — the relative one is useless
-                            # outside the app (tester catch 2026-07-12: it copied just the
-                            # filename).
-                            "abs_path": str(path),
-                            "name": path.name,
-                            "kind": _artifact_kind(path),
-                            "size": st.st_size,
-                            "modified_at": st.st_mtime,
-                        }
-                    )
-                except OSError:
-                    continue
+                    path = Path(dirpath) / name
+                    if path.suffix.lower() not in suffixes:
+                        continue
+                    try:
+                        st = path.stat()
+                        if not path.is_file():
+                            continue
+                        resolved = path.resolve()
+                        if resolved in seen_paths:
+                            continue
+                        seen_paths.add(resolved)
+                        out.append(
+                            {
+                                "path": str(path.relative_to(root)),
+                                # Absolute path for "Copy path" — the relative one is useless
+                                # outside the app (tester catch 2026-07-12: it copied just the
+                                # filename).
+                                "abs_path": str(path),
+                                "name": path.name,
+                                "kind": _artifact_kind(path),
+                                "size": st.st_size,
+                                "modified_at": st.st_mtime,
+                            }
+                        )
+                    except OSError:
+                        continue
         out.sort(key=lambda a: a["modified_at"], reverse=True)
         return out[:80]
 
@@ -1319,24 +1323,23 @@ class SessionManager:
         self, session_id: str, path: str, *, allow_dir: bool = False
     ) -> tuple[Optional[Path], Optional[str]]:
         """Resolve an artifact path under the session's workspace, or (None, error)."""
-        record = self.session_store.load(session_id)
-        workspace = record.workspace if record else self.default_workspace
-        if not workspace:
+        roots = [Path(r["path"]).expanduser().resolve() for r in self.get_roots(session_id)]
+        if not roots:
             return None, "no workspace"
-        root = Path(workspace).expanduser().resolve()
-        target = (root / path).expanduser().resolve()
-        try:
-            target.relative_to(root)
-        except ValueError:
-            return None, "path escapes workspace"
-        if allow_dir and target.is_dir():
-            return target, None
-        if not target.is_file():
-            return None, (
-                "This isn't in the conversation's folder anymore — it may have been "
-                "moved or deleted."
-            )
-        return target, None
+        for root in roots:
+            target = (root / path).expanduser().resolve()
+            try:
+                target.relative_to(root)
+            except ValueError:
+                continue
+            if allow_dir and target.is_dir():
+                return target, None
+            if target.is_file():
+                return target, None
+        return None, (
+            "This isn't in the conversation's folder anymore — it may have been "
+            "moved or deleted."
+        )
 
     def read_artifact(self, session_id: str, path: str) -> dict[str, Any]:
         # Folders are readable too (a model sometimes links a whole package, e.g. a skill
