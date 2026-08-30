@@ -1,0 +1,135 @@
+import { describe, expect, it } from "vitest";
+import tauriConf from "../src-tauri/tauri.conf.json";
+import rightRailSource from "./components/RightRail.tsx?raw";
+
+// #99: the shell shipped with `csp: null`, so the webview ran with no Content Security Policy at
+// all. Tauri only emits the header when the config sets one, and the policy is inherited by the
+// artifact `srcdoc` iframe (RightRail.tsx), so a regression here silently re-opens the
+// XSS -> unauthenticated local sidecar API pivot.
+//
+// These are config/source invariants, deliberately. The real header only exists on the `tauri://`
+// origin of a packaged build: it is absent under `tauri dev` (the devUrl path returns no CSP) and
+// invisible to both vitest (jsdom) and Playwright (vite dev server). This file is the only
+// automated signal available; the end-to-end check is a packaged-build walkthrough.
+
+// Tauri's CspDirectiveSources accepts either a string or a list of sources, and the upstream docs
+// use both forms — so normalize rather than assume. Typing this as `string` alone would turn a
+// legal reformat of one directive into a list into `value.split is not a function`, i.e. a crash
+// instead of a verdict.
+type Sources = string | string[];
+
+const csp = (
+  tauriConf as unknown as { app: { security: { csp: Record<string, Sources> | null } } }
+).app.security.csp;
+
+const toTokens = (value: Sources): string[] =>
+  (Array.isArray(value) ? value.join(" ") : value).split(/\s+/).filter(Boolean);
+
+const tokensOf = (directive: string): string[] => toTokens(csp?.[directive] ?? "");
+
+// Each directive and the sources it must allow, traced to real call sites:
+//   connect-src  ipc:/http://ipc.localhost  -> the invokes in src/tauri.ts (folder picker,
+//                autostart, keep-awake, dictation); loopback wildcards -> the sidecar port, which
+//                src-tauri/src/lib.rs `free_port()` re-picks every launch.
+//   img-src      data: -> data_url attachment previews and Vite-inlined provider logos;
+//                https: -> remote images in agent-authored markdown.
+//   style-src    'unsafe-inline' -> React `style={{…}}` attributes, which cannot take a nonce.
+//   worker-src   'self' for the bundled pdf.js worker, and blob: because pdf.js re-wraps it:
+//                the shipped build wraps workerSrc in a blob: URL whenever the document origin is
+//                non-HTTP, and Tauri serves tauri://localhost on macOS/Linux, whose URL origin is
+//                "null". Dropping blob: breaks PDF preview on those platforms only — Windows uses
+//                http://tauri.localhost and would keep working, hiding it.
+//   child-src    the same sources again, as the pre-CSP3 fallback. worker-src is Safari 15.5+,
+//                which shipped in macOS 12.4, but the bundle declares minimumSystemVersion 12.0.
+//                On 12.0-12.3 worker-src is ignored and the chain is worker-src -> child-src ->
+//                script-src -> default-src, so without child-src the workers land on
+//                script-src 'self' and PDF preview breaks again. frame-src is Safari 7 and takes
+//                precedence for frames, so this does not widen framing.
+const REQUIRED: ReadonlyArray<readonly [string, readonly string[]]> = [
+  ["default-src", ["'self'"]],
+  ["script-src", ["'self'"]],
+  ["style-src", ["'self'", "'unsafe-inline'"]],
+  ["img-src", ["'self'", "data:", "https:"]],
+  ["font-src", ["'self'"]],
+  ["worker-src", ["'self'", "blob:"]],
+  ["child-src", ["'self'", "blob:"]],
+  [
+    "connect-src",
+    ["'self'", "ipc:", "http://ipc.localhost", "http://127.0.0.1:*", "ws://127.0.0.1:*"],
+  ],
+  ["frame-src", ["'self'"]],
+  ["object-src", ["'none'"]],
+  ["base-uri", ["'self'"]],
+  ["form-action", ["'none'"]],
+];
+
+describe("desktop CSP", () => {
+  // Both config shapes must read the same, so switching a directive to the list form stays a
+  // verdict rather than becoming a TypeError.
+  it.each([
+    { shape: "string", value: "'self' blob:" as Sources },
+    { shape: "list", value: ["'self'", "blob:"] as Sources },
+  ])("reads a directive written in $shape form", ({ value }) => {
+    expect(toTokens(value)).toEqual(["'self'", "blob:"]);
+  });
+
+  it("is configured at all (the #99 regression: csp was null)", () => {
+    expect(csp).toBeTruthy();
+    expect(typeof csp).toBe("object");
+  });
+
+  it.each(REQUIRED)("%s allows the sources it needs", (directive, sources) => {
+    const actual = tokensOf(directive);
+    for (const source of sources) expect(actual).toContain(source);
+  });
+
+  it("pins default-src to 'self' exactly", () => {
+    expect(tokensOf("default-src")).toEqual(["'self'"]);
+  });
+
+  // Forbidden sources. `'unsafe-eval'` is why RightRail passes isEvalSupported: false to pdf.js,
+  // and `'unsafe-inline'` in script-src would defeat the point of the policy — Tauri hashes the
+  // inline theme script in index.html at build time, so it is never needed. The directives to scan
+  // are carried in the row, not re-derived from the test name: a label is documentation, and using
+  // it as control flow means a typo silently widens what gets checked.
+  const allDirectives = () => Object.keys(csp ?? {});
+  it.each([
+    { token: "'unsafe-eval'", where: "any directive", directives: allDirectives },
+    { token: "'unsafe-inline'", where: "script-src", directives: () => ["script-src"] },
+  ])("never allows $token in $where", ({ token, directives }) => {
+    for (const directive of directives()) expect(tokensOf(directive)).not.toContain(token);
+  });
+
+  // Edge case: a bare `*` is a wildcard host and must never appear, but the loopback entries
+  // legitimately end in `:*` (a port wildcard). Token-exact matching, not substring, is what keeps
+  // `http://127.0.0.1:*` passing while `*` fails.
+  it("has no bare wildcard source in any directive", () => {
+    for (const directive of Object.keys(csp ?? {})) {
+      expect(tokensOf(directive)).not.toContain("*");
+    }
+  });
+
+  // child-src is only consulted where worker-src is unsupported, so the two must not drift: any
+  // source worker-src grants has to be in child-src too, or the older-WebKit path is stricter than
+  // the modern one and fails only on the platforms hardest to test.
+  it("keeps child-src a superset of worker-src for the pre-CSP3 fallback", () => {
+    expect(tokensOf("child-src")).toEqual(expect.arrayContaining(tokensOf("worker-src")));
+  });
+
+  it("keeps the port wildcard on the loopback sidecar origins", () => {
+    expect(tokensOf("connect-src")).toEqual(
+      expect.arrayContaining(["http://127.0.0.1:*", "ws://127.0.0.1:*"]),
+    );
+  });
+});
+
+describe("pdf.js needs no unsafe-eval", () => {
+  // pdf.js defaults isEvalSupported to true and compiles PostScript functions with `new Function()`
+  // in worker code, which inherits this document's policy — so the default would demand
+  // 'unsafe-eval'. Asserts the call site, not runtime pdf.js behaviour: without this, doing the
+  // config change and forgetting the pdf.js one leaves the suite green while packaged PDF
+  // artifacts break, in exactly the blind spot no test here can reach.
+  it("passes isEvalSupported: false at the getDocument call site", () => {
+    expect(rightRailSource).toMatch(/getDocument\(\{[^}]*isEvalSupported:\s*false[^}]*\}\)/);
+  });
+});
